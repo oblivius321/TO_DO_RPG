@@ -1,19 +1,25 @@
-from services import add_xp, get_title_for_level
+from services import apply_xp, get_title_for_level
 
-class User:
-    def __init__(self, level=1, xp=0):
+
+class DummyUser:
+    def __init__(self, level: int = 1, current_xp: int = 0, total_xp: int = 0):
         self.level = level
-        self.xp = xp
+        self.current_xp = current_xp
+        self.total_xp = total_xp
+        self.title = get_title_for_level(level)
 
-user = User(level=1, xp=0)
 
-# XP ganho por dia aumentado para forçar evolução de título
-dias = [120, 150, 200, 250, 300, 400, 500, 600]
+user = DummyUser()
 
-for i, xp_ganho in enumerate(dias, start=1):
-    resultado = add_xp(user, xp_ganho, tarefas_completas=True)
-    titulo = get_title_for_level(user.level)
-    print(f"----- DIA {i} -----")
-    print(resultado)
-    print(f"Nível atual: {user.level} | XP: {user.xp} | Título: {titulo}")
+xp_entries = [120, 150, 200, 250, 300, 400, 500, 600]
+
+for day_index, xp_gain in enumerate(xp_entries, start=1):
+    result = apply_xp(user, xp_gain)
+    user.title = result["title"]
+    print(f"----- DIA {day_index} -----")
+    print(
+        f"XP ganho: {result['xp_awarded']} | XP atual: {result['current_xp']} | "
+        f"Nível: {result['level']} | Level ups: {result['level_ups']}"
+    )
+    print(f"Título: {user.title} | XP total acumulado: {user.total_xp}")
     print()

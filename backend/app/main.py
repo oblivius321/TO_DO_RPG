@@ -2,7 +2,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Importação ABSOLUTA em vez de relativa
+# Importação absoluta do router
 from routes import router
 
 app = FastAPI(title="To-Do RPG API")

@@ -1,165 +1,267 @@
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from typing import List
-from sqlalchemy.orm import Session
+from datetime import date
 
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import Request
+from sqlalchemy.orm import Session, selectinload
 
-import services
+import dependencies
 import models
-import database
+import schemas
+import security
+import services
+
 
 router = APIRouter()
 
+# Simulação de armazenamento de tokens de recuperação
+reset_tokens = {}
 
-def get_db():
-    db = database.SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+from fastapi import Body
+from jose import jwt
+from datetime import datetime, timedelta
 
-class TaskCreate(BaseModel):
-    title: str
-    completed: bool = False
+def get_user_by_email(email: str, db):
+    return db.query(models.User).filter(models.User.email == email).first()
 
-class TaskResponse(BaseModel):
-    id: int
-    title: str
-    completed: bool
-
-    class Config:
-        from_attributes = True
-
-# Modelo para resposta do usuário
-class UserResponse(BaseModel):
-    id: int
-    name: str
-    level: int
-    xp: int
-    title: str
-
-    class Config:
-        from_attributes = True
-
-# ID do usuário padrão (por enquanto)
-DEFAULT_USER_ID = 1
-
-@router.get("/tasks", response_model=List[TaskResponse])
-def get_tasks(db: Session = Depends(get_db)):
-    tasks = db.query(models.Task).filter(models.Task.owner_id == DEFAULT_USER_ID).all()
-    return tasks
-
-@router.post("/tasks")
-def add_task(task_data: TaskCreate, db: Session = Depends(get_db)):
-    # Cria nova task
-    new_task = models.Task(
-        title=task_data.title,
-        completed=task_data.completed,
-        owner_id=DEFAULT_USER_ID
-    )
-    
-    db.add(new_task)
-    db.commit()
-    db.refresh(new_task)
-    
-    return {
-        "message": "Task adicionada!",
-        "task": new_task
-    }
-
-@router.put("/tasks/{task_id}/complete")
-def complete_task(task_id: int, db: Session = Depends(get_db)):
-    # 1. Encontrar a task
-    task = db.query(models.Task).filter(
-        models.Task.id == task_id, 
-        models.Task.owner_id == DEFAULT_USER_ID
-    ).first()
-    
-    if not task:
-        raise HTTPException(status_code=404, detail="Task não encontrada")
-    
-    if task.completed:
-        return {"message": "Task já estava completa!"}
-    
-    # 2. Marcar como completa
-    task.completed = True
-    
-    # 3. Buscar usuário
-    user = db.query(models.User).filter(models.User.id == DEFAULT_USER_ID).first()
-    if not user:
-        # Criar usuário padrão se não existir
-        user = models.User(id=DEFAULT_USER_ID, name="Jogador", level=1, xp=0, title="Novato")
-        db.add(user)
-    
-    # 4. Verificar se TODAS as tasks estão completas
-    todas_tasks = db.query(models.Task).filter(models.Task.owner_id == DEFAULT_USER_ID).all()
-    todas_completas = all(task.completed for task in todas_tasks)
-    
-    # 5. Aplicar sistema de XP - SEU SERVICES.PY 🎮
-    xp_ganho = 10
-    mensagem_xp = services.add_xp(user, xp_ganho, todas_completas)
-    
-    # 6. SALVAR AS ALTERAÇÕES NO BANCO
-    db.commit()
-    db.refresh(user)  # Atualiza os dados do usuário
-    
-    # 7. Preparar resposta
-    response = {
-        "message": f"✅ Task '{task.title}' completada!",
-        "xp_ganho": xp_ganho,
-        "xp_total": user.xp,
-        "level": user.level,
-        "title": user.title,
-        "system_message": mensagem_xp
-    }
-    
-    # 8. Adicionar bônus se todas completas
-    if todas_completas:
-        response["bonus_diario"] = "🎉 TODAS TASKS COMPLETAS! Bônus aplicado!"
-    
-    return response
-
-@router.get("/user/stats", response_model=UserResponse)
-def get_user_stats(db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.id == DEFAULT_USER_ID).first()
-    if not user:
-        # Criar usuário padrão se não existir
-        user = models.User(id=DEFAULT_USER_ID, name="Jogador", level=1, xp=0, title="Novato")
-        db.add(user)
+def update_user_password(user_id: int, new_password: str, db):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if user:
+        user.password_hash = security.get_password_hash(new_password)
         db.commit()
         db.refresh(user)
-    
     return user
 
-@router.delete("/tasks/{task_id}")
-def delete_task(task_id: int, db: Session = Depends(get_db)):
-    task = db.query(models.Task).filter(
-        models.Task.id == task_id, 
-        models.Task.owner_id == DEFAULT_USER_ID
-    ).first()
-    
-    if not task:
-        raise HTTPException(status_code=404, detail="Task não encontrada")
-    
-    db.delete(task)
-    db.commit()
-    
-    return {"message": f"Task '{task.title}' deletada!"}
+# Endpoint para solicitar recuperação de senha
+@router.post("/auth/forgot-password")
+def forgot_password(
+    email: str = Body(..., embed=True),
+    db: Session = Depends(dependencies.get_db),
+):
+    user = get_user_by_email(email, db)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    expire = datetime.utcnow() + timedelta(minutes=30)
+    token = jwt.encode({"sub": user.id, "exp": expire}, security.SECRET_KEY, algorithm=security.ALGORITHM)
+    reset_tokens[token] = user.id
+    # Em produção, envie por email. Aqui, só retorna.
+    return {"reset_token": token}
 
-@router.post("/reset")
-def reset_system(db: Session = Depends(get_db)):
-    """Endpoint para resetar o sistema (apenas para testes)"""
-    # Deletar todas as tasks
-    db.query(models.Task).filter(models.Task.owner_id == DEFAULT_USER_ID).delete()
-    
-    # Resetar usuário
-    user = db.query(models.User).filter(models.User.id == DEFAULT_USER_ID).first()
-    if user:
-        user.level = 1
-        user.xp = 0
-        user.title = "Novato"
-    
+# Endpoint para redefinir senha
+@router.post("/auth/reset-password")
+def reset_password(
+    token: str = Body(..., embed=True),
+    new_password: str = Body(..., embed=True),
+    db: Session = Depends(dependencies.get_db),
+):
+    try:
+        payload = jwt.decode(token, security.SECRET_KEY, algorithms=[security.ALGORITHM])
+        user_id = payload.get("sub")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Token inválido ou expirado")
+    if reset_tokens.get(token) != user_id:
+        raise HTTPException(status_code=400, detail="Token não reconhecido")
+    user = update_user_password(user_id, new_password, db)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    reset_tokens.pop(token)
+    return {"message": "Senha redefinida com sucesso"}
+
+
+
+# Helper para fingerprint
+def get_fingerprint(request: Request) -> str:
+    ua = request.headers.get("user-agent", "")
+    ip = request.client.host if request.client else ""
+    return security._hash_token(f"{ua}:{ip}")
+
+
+@router.post("/auth/register", response_model=schemas.UserRead, status_code=status.HTTP_201_CREATED)
+def register_user(
+    payload: schemas.UserCreate,
+    db: Session = Depends(dependencies.get_db),
+):
+    if db.query(models.User).filter_by(email=payload.email).first():
+        raise HTTPException(400, "E-mail já cadastrado")
+
+    user = models.User(
+        name=payload.name,
+        email=payload.email,
+        password_hash=security.hash_password(payload.password),
+        is_active=True,
+    )
+
+    db.add(user)
     db.commit()
-    
-    return {"message": "Sistema resetado! 🎮"}
+    db.refresh(user)
+    return user
+
+
+# =====================================================
+# AUTH — LOGIN
+# =====================================================
+
+@router.post("/auth/login", response_model=schemas.Token)
+def login(
+    request: Request,
+    form: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(dependencies.get_db),
+):
+    user = db.query(models.User).filter_by(email=form.username).first()
+
+    if not user or not security.verify_password(form.password, user.password_hash):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Credenciais inválidas")
+
+    if not user.is_active:
+        raise HTTPException(403, "Usuário inativo")
+
+    fingerprint = get_fingerprint(request)
+
+    access = security.create_access_token(
+        user_id=str(user.id),
+        fingerprint=fingerprint,
+    )
+
+    refresh = security.create_refresh_token(
+        user_id=str(user.id),
+        fingerprint=fingerprint,
+    )
+
+    # Persistir refresh (hash + jti)
+    db.add(
+        models.RefreshSession(
+            jti=refresh["jti"],
+            token_hash=refresh["token_hash"],
+            user_id=user.id,
+            expires_at=security._now() + timedelta(days=security.REFRESH_TOKEN_DAYS),
+        )
+    )
+    db.commit()
+
+    return {
+        "access_token": access,
+        "refresh_token": refresh["token"],
+        "token_type": "bearer",
+    }
+
+
+    # =====================================================
+    # AUTH — REFRESH
+    # =====================================================
+
+    @router.post("/auth/refresh", response_model=schemas.Token)
+    def refresh_token(
+        request: Request,
+        refresh_token: str = Body(..., embed=True),
+        db: Session = Depends(dependencies.get_db),
+    ):
+        fingerprint = get_fingerprint(request)
+
+        def is_jti_active(jti: str) -> bool:
+            return db.query(models.RefreshSession).filter_by(jti=jti, revoked=False).first() is not None
+
+        def revoke_jti(jti: str):
+            db.query(models.RefreshSession).filter_by(jti=jti).update({"revoked": True})
+
+        def store_new_jti(jti, token_hash, user_id, expires_at):
+            db.add(
+                models.RefreshSession(
+                    jti=jti,
+                    token_hash=token_hash,
+                    user_id=int(user_id),
+                    expires_at=expires_at,
+                )
+            )
+
+        tokens = security.rotate_refresh_token(
+            old_token=refresh_token,
+            fingerprint=fingerprint,
+            is_jti_active=is_jti_active,
+            revoke_jti=revoke_jti,
+            store_new_jti=store_new_jti,
+        )
+
+        db.commit()
+        return {
+            "access_token": tokens["access_token"],
+            "refresh_token": tokens["refresh_token"],
+            "token_type": "bearer",
+        }
+
+
+    # =====================================================
+    # AUTH — FORGOT / RESET PASSWORD
+    # =====================================================
+
+    @router.post("/auth/forgot-password")
+    def forgot_password(
+        email: str = Body(..., embed=True),
+        db: Session = Depends(dependencies.get_db),
+    ):
+        user = db.query(models.User).filter_by(email=email).first()
+        if not user:
+            return {"message": "Se existir, enviaremos instruções"}  # anti-enumeração
+
+        token = security.create_access_token(
+            user_id=str(user.id),
+            fingerprint="password-reset",
+            extra_claims={"type": "password_reset"},
+        )
+
+        # Em produção: enviar por e-mail
+        return {"reset_token": token}
+
+
+    @router.post("/auth/reset-password")
+    def reset_password(
+        token: str = Body(...),
+        new_password: str = Body(...),
+        db: Session = Depends(dependencies.get_db),
+    ):
+        try:
+            payload = security.decode_token(
+                token=token,
+                expected_type="password_reset",
+                fingerprint="password-reset",
+            )
+        except ValueError:
+            raise HTTPException(400, "Token inválido")
+
+        user = db.query(models.User).filter_by(id=int(payload["sub"])).first()
+        if not user:
+            raise HTTPException(404, "Usuário não encontrado")
+
+        user.password_hash = security.hash_password(new_password)
+
+        # Revoga TODAS as sessões
+        db.query(models.RefreshSession).filter_by(user_id=user.id).update({"revoked": True})
+
+        db.commit()
+        return {"message": "Senha redefinida com sucesso"}
+
+
+    # =====================================================
+    # USERS / TASKS (INALTERADOS, SÓ DEPENDÊNCIA SEGURA)
+    # =====================================================
+
+    @router.get("/users/me", response_model=schemas.UserRead)
+    def get_me(
+        current_user: models.User = Depends(dependencies.get_current_user),
+    ):
+        return current_user
+
+
+@router.get("/users/me/stats", response_model=schemas.UserRead)
+def get_my_stats(
+    current_user: models.User = Depends(dependencies.get_current_user),
+    db: Session = Depends(dependencies.get_db),
+):
+    db.refresh(current_user)
+    return current_user
+
+
+@router.get("/health", response_model=schemas.Message)
+def healthcheck():
+    return schemas.Message(message="OK")
